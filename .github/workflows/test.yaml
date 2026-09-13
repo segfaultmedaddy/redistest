@@ -1,0 +1,42 @@
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: "write"
+      contents: "read"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@v19
+      - uses: cachix/cachix-action@v16
+        with:
+          name: devenv
+          skipPush: true
+      - uses: DeterminateSystems/flake-checker-action@v12
+      - run: nix profile add nixpkgs#devenv
+      - name: Go Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            /home/runner/.cache/go-build
+            .devenv/state/go
+          key: ${{ runner.os }}-go-v1-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-v1-
+      - name: Load nix environment into PATH
+        shell: devenv shell bash -- -e {0}
+        run: bash -c 'eval "$(devenv print-dev-env)" && echo "PATH=$PATH" >> $GITHUB_ENV'
+      - name: Lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          install-mode: "none"
+          working-directory: .
+      - name: Test
+        shell: devenv shell bash -- -e {0}
+        env:
+          GOCACHE: /home/runner/.cache/go-build
+        run: devenv tasks run go:test-ci
