@@ -6,13 +6,6 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    services:
-      redis:
-        image: redis:8-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping" --health-interval 1s --health-timeout 5s --health-retries 30
     permissions:
       id-token: "write"
       contents: "read"
@@ -42,12 +35,8 @@ jobs:
         with:
           install-mode: "none"
           working-directory: .
-      - name: Check Redis
-        shell: devenv shell bash -- -e {0}
-        run: redis-cli -h 127.0.0.1 -p 6379 PING
       - name: Test
         shell: devenv shell bash -- -e {0}
         env:
           GOCACHE: /home/runner/.cache/go-build
-          TEST_REDIS_ADDRESS: 127.0.0.1:6379
-        run: go test -race -count=1 -timeout=90s -cover ./...
+        run: devenv tasks run go:test-ci
