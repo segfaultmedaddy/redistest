@@ -42,8 +42,12 @@ jobs:
         with:
           install-mode: "none"
           working-directory: .
+      - name: Check Redis
+        shell: devenv shell bash -- -e {0}
+        run: redis-cli -h 127.0.0.1 -p 6379 PING
       - name: Test
         shell: devenv shell bash -- -e {0}
         env:
           GOCACHE: /home/runner/.cache/go-build
-        run: devenv tasks run go:test
+          TEST_REDIS_ADDRESS: 127.0.0.1:6379
+        run: go test -race -count=1 -timeout=90s -cover ./...
