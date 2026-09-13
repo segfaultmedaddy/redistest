@@ -6,13 +6,13 @@ import (
 	"net/url"
 	"os"
 	"strconv"
-	"sync"
 	"testing"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 
 	"go.segfaultmedaddy.com/redistest"
 )
@@ -171,8 +171,6 @@ func Test_RedisFactory_Client(t *testing.T) {
 		// Arrange
 		const clientCount = 10
 
-		var wg sync.WaitGroup
-
 		prefixRoot := "redistest:" + url.PathEscape(t.Name()) + ":"
 		concurrentPrefixer := &incrementingPrefixer{root: prefixRoot}
 		concurrentFactory, err := redistest.NewFactory(
@@ -192,39 +190,39 @@ func Test_RedisFactory_Client(t *testing.T) {
 		}
 
 		results := make([]struct {
-			setErr              error
-			physicalErr         error
-			logicalErr          error
 			actualPhysicalValue string
 			actualLogicalValue  string
 		}, clientCount)
-		start := make(chan struct{})
+		group, ctx := errgroup.WithContext(t.Context())
 
 		// Act
 		for i, client := range clients {
-			wg.Go(func() {
-				<-start
+			group.Go(func() error {
+				if err := client.Set(ctx, "shared-key", expectedValues[i], 0).Err(); err != nil {
+					return fmt.Errorf("failed to set value for client %d: %w", i, err)
+				}
 
-				results[i].setErr = client.Set(t.Context(), "shared-key", expectedValues[i], 0).Err()
-				results[i].actualPhysicalValue, results[i].physicalErr = admin.Get(
-					t.Context(),
-					physicalKeys[i],
-				).Result()
-				results[i].actualLogicalValue, results[i].logicalErr = client.Get(
-					t.Context(),
-					"shared-key",
-				).Result()
+				var err error
+
+				results[i].actualPhysicalValue, err = admin.Get(ctx, physicalKeys[i]).Result()
+				if err != nil {
+					return fmt.Errorf("failed to get physical value for client %d: %w", i, err)
+				}
+
+				results[i].actualLogicalValue, err = client.Get(ctx, "shared-key").Result()
+				if err != nil {
+					return fmt.Errorf("failed to get logical value for client %d: %w", i, err)
+				}
+
+				return nil
 			})
 		}
 
-		close(start)
-		wg.Wait()
+		actualError := group.Wait()
+		require.NoError(t, actualError)
 
 		// Assert
 		for i, result := range results {
-			require.NoError(t, result.setErr)
-			require.NoError(t, result.physicalErr)
-			require.NoError(t, result.logicalErr)
 			assert.Equal(t, expectedValues[i], result.actualPhysicalValue)
 			assert.Equal(t, expectedValues[i], result.actualLogicalValue)
 		}
