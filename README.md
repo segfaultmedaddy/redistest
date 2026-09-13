@@ -1,11 +1,11 @@
 # redistest
 
-Isolated Redis testing for Go using namespaced keys.
+Run Redis-backed Go tests in parallel without them interfering with each other.
 
-redistest provides isolated test environments for Redis-backed functionality
-in Go. It creates standard [go-redis](https://github.com/redis/go-redis)
-clients with a separate view of Redis keys for each test, allowing tests to
-share a Redis server without sharing state.
+redistest gives each test a standard
+[go-redis](https://github.com/redis/go-redis) client with an isolated view of
+Redis keys. Parallel tests can share one Redis server and reuse the same logical
+key names without reading, overwriting, or deleting each other's data.
 
 ## Usage
 
@@ -45,7 +45,7 @@ up and closed when the test completes.
 func TestUsers(t *testing.T) {
     t.Parallel()
 
-    ctx := context.Background()
+    ctx := t.Context()
     client := factory.Client(t)
 
     err := client.Set(ctx, "user:1", "Alice", 0).Err()
@@ -59,37 +59,29 @@ func TestUsers(t *testing.T) {
 
 ## Behavior
 
-Call `factory.Client(t)` once for each test and use the result like any other
-`redis.UniversalClient`. Separate tests can use the same logical key names,
-including while running in parallel, without reading or modifying each other's
-values. Key-based commands, multi-key commands, pipelines, and transactions
-use the test's isolated keyspace automatically.
+`factory.Client(t)` creates a standard `redis.UniversalClient` with a namespace
+unique to the current test. Before Redis receives a command, redistest uses the
+server's command metadata to identify its key arguments and prefixes only those
+keys. Pipelines and transactions use the same process, so parallel tests can
+safely reuse logical key names while storing data under different physical
+keys.
 
-When a test succeeds, redistest removes its keys and closes its client. Cleanup
-errors are written to the test log without failing the test. When a test fails,
-its keys are left in Redis for debugging and the matching key pattern is
-written to the test log.
+When the test succeeds, redistest removes the keys in its namespace and closes
+the client. Failed tests keep their keys for inspection.
 
-The factory should normally be created once in `TestMain` and shared by the
-entire test suite. Multiple test binaries can use the same Redis server at the
-same time without sharing their isolated keys.
+### Unsupported commands
 
-redistest requires Redis 7 or newer and Redis credentials that permit
-`COMMAND INFO`. A command returns an error when Redis cannot provide complete
-information about its key arguments.
+redistest supports commands whose key arguments Redis fully describes through
+`COMMAND INFO`. If Redis reports an incomplete or unknown key specification,
+redistest returns an error without executing the command. Examples include
+`XREAD`, `XREADGROUP`, `MIGRATE`, `GEORADIUS`, `GEORADIUSBYMEMBER`, `SORT`, and
+`SORT_RO`. The exact set depends on the Redis version.
 
-Some Redis operations are not based on keys and therefore are not isolated:
-
-- Server-wide and keyspace-inspection commands such as `FLUSHDB`, `DBSIZE`,
-  `KEYS`, and `SCAN` still operate on the shared Redis database.
-- Pub/Sub channels are shared because channel names are not Redis keys.
-- Scripts must declare every accessed key through their `KEYS` arguments.
-- A process crash or timeout can leave test keys behind. Use expirations or a
-  disposable Redis instance if retained data is a concern.
-
-The package is deliberately built on top of
-[go-redis](https://github.com/redis/go-redis) and returns its
-`redis.UniversalClient` interface.
+Commands without key arguments are sent unchanged and are therefore not
+isolated. This includes database-wide commands such as `FLUSHDB`, `FLUSHALL`,
+`DBSIZE`, `KEYS`, and `SCAN`, as well as Pub/Sub commands. Scripts and functions
+must declare every key through their key arguments; keys constructed inside the
+script are not prefixed.
 
 ## Development
 
