@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,6 +21,17 @@ type deterministicPrefixer struct{}
 
 func (deterministicPrefixer) Prefix(testName string) string {
 	return "redistest:" + url.PathEscape(testName) + ":"
+}
+
+type incrementingPrefixer struct {
+	root string
+	next int
+}
+
+func (p *incrementingPrefixer) Prefix(_ string) string {
+	p.next++
+
+	return p.root + strconv.Itoa(p.next) + ":"
 }
 
 func Test_RedisFactory_Client_Pipeline(t *testing.T) {
@@ -157,50 +169,64 @@ func Test_RedisFactory_Client(t *testing.T) {
 		t.Parallel()
 
 		// Arrange
-		const clients = 10
+		const clientCount = 10
 
-		ready := make(chan struct{}, clients)
-		release := make(chan struct{})
+		var wg sync.WaitGroup
 
-		go func() {
-			for range clients {
-				<-ready
-			}
+		prefixRoot := "redistest:" + url.PathEscape(t.Name()) + ":"
+		concurrentPrefixer := &incrementingPrefixer{root: prefixRoot}
+		concurrentFactory, err := redistest.NewFactory(
+			redistest.WithOptions(opts),
+			redistest.WithPrefixer(concurrentPrefixer),
+		)
+		require.NoError(t, err)
 
-			close(release)
-		}()
+		clients := make([]redis.UniversalClient, clientCount)
+		expectedValues := make([]string, clientCount)
+		physicalKeys := make([]string, clientCount)
 
-		for i := range clients {
-			name := fmt.Sprintf(
-				"should isolate keys for client %d when clients are used concurrently",
-				i,
-			)
-			t.Run(name, func(t *testing.T) {
-				t.Parallel()
+		for i := range clientCount {
+			clients[i] = concurrentFactory.Client(t)
+			expectedValues[i] = strconv.Itoa(i)
+			physicalKeys[i] = prefixRoot + strconv.Itoa(i+1) + ":shared-key"
+		}
 
-				// Arrange
-				client := factory.Client(t)
-				expectedValue := strconv.Itoa(i)
-				physicalKey := prefixer.Prefix(t.Name()) + "shared-key"
+		results := make([]struct {
+			setErr              error
+			physicalErr         error
+			logicalErr          error
+			actualPhysicalValue string
+			actualLogicalValue  string
+		}, clientCount)
+		start := make(chan struct{})
 
-				ready <- struct{}{}
+		// Act
+		for i, client := range clients {
+			wg.Go(func() {
+				<-start
 
-				<-release
-
-				// Act
-				err := client.Set(t.Context(), "shared-key", expectedValue, 0).Err()
-				require.NoError(t, err)
-
-				actualPhysicalValue, physicalErr := admin.Get(t.Context(), physicalKey).Result()
-				require.NoError(t, physicalErr)
-
-				actualLogicalValue, logicalErr := client.Get(t.Context(), "shared-key").Result()
-				require.NoError(t, logicalErr)
-
-				// Assert
-				assert.Equal(t, expectedValue, actualPhysicalValue)
-				assert.Equal(t, expectedValue, actualLogicalValue)
+				results[i].setErr = client.Set(t.Context(), "shared-key", expectedValues[i], 0).Err()
+				results[i].actualPhysicalValue, results[i].physicalErr = admin.Get(
+					t.Context(),
+					physicalKeys[i],
+				).Result()
+				results[i].actualLogicalValue, results[i].logicalErr = client.Get(
+					t.Context(),
+					"shared-key",
+				).Result()
 			})
+		}
+
+		close(start)
+		wg.Wait()
+
+		// Assert
+		for i, result := range results {
+			require.NoError(t, result.setErr)
+			require.NoError(t, result.physicalErr)
+			require.NoError(t, result.logicalErr)
+			assert.Equal(t, expectedValues[i], result.actualPhysicalValue)
+			assert.Equal(t, expectedValues[i], result.actualLogicalValue)
 		}
 	})
 
