@@ -60,14 +60,15 @@ func TestUsers(t *testing.T) {
 ## Behavior
 
 `factory.Client(t)` creates a standard `redis.UniversalClient` with a namespace
-unique to the current test. Before Redis receives a command, redistest uses the
-server's command metadata to identify its key arguments and prefixes only those
-keys. Pipelines and transactions use the same process, so parallel tests can
-safely reuse logical key names while storing data under different physical
-keys.
+unique to that client. Multiple clients requested by the same test are isolated
+from each other. Before Redis receives a command, redistest uses the server's
+command metadata to identify its key arguments and prefixes only those keys.
+Pipelines and transactions use the same process, so parallel tests can safely
+reuse logical key names while storing data under different physical keys.
 
-When the test succeeds, redistest removes the keys in its namespace and closes
-the client. Failed tests keep their keys for inspection.
+When a test completes, redistest removes the keys in its namespace and closes
+the client. Pass `redistest.WithKeepKeysOnFailure(true)` to `NewFactory` to keep
+the keys from failed tests for inspection. The client is still closed.
 
 ### Unsupported commands
 

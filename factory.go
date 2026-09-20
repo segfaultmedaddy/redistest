@@ -5,12 +5,13 @@ package redistest
 import (
 	"context"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,11 +33,13 @@ const (
 // can be shared by parallel tests and reuses cached Redis command metadata
 // across its clients.
 type RedisFactory struct {
-	mclient    redis.UniversalClient
-	prefixer   Prefixer
-	opts       *redis.UniversalOptions
-	keyFinders map[string]*commandinfo.KeyFinder
-	mu         sync.Mutex
+	mclient           redis.UniversalClient
+	prefixer          Prefixer
+	opts              *redis.UniversalOptions
+	keyFinders        map[string]*commandinfo.KeyFinder
+	mu                sync.Mutex
+	ctn               atomic.Uint64
+	keepKeysOnFailure bool
 }
 
 // Prefixer creates the key prefix used to isolate a test.
@@ -66,6 +69,14 @@ func WithPrefixer(prefixer Prefixer) Option {
 	}
 }
 
+// WithKeepKeysOnFailure controls whether keys are retained when a test fails.
+// By default, keys are removed after both successful and failed tests.
+func WithKeepKeysOnFailure(keep bool) Option {
+	return func(f *RedisFactory) {
+		f.keepKeysOnFailure = keep
+	}
+}
+
 // NewFactory creates a new [RedisFactory].
 //
 // Unless [WithPrefixer] is provided, NewFactory generates a random
@@ -75,11 +86,13 @@ func WithPrefixer(prefixer Prefixer) Option {
 // used.
 func NewFactory(opts ...Option) (*RedisFactory, error) {
 	f := RedisFactory{
-		mclient:    nil,
-		prefixer:   nil,
-		opts:       nil,
-		keyFinders: make(map[string]*commandinfo.KeyFinder),
-		mu:         sync.Mutex{},
+		mclient:           nil,
+		prefixer:          nil,
+		opts:              nil,
+		keyFinders:        make(map[string]*commandinfo.KeyFinder),
+		mu:                sync.Mutex{},
+		ctn:               atomic.Uint64{},
+		keepKeysOnFailure: false,
 	}
 	for _, opt := range opts {
 		opt(&f)
@@ -111,8 +124,9 @@ func NewFactory(opts ...Option) (*RedisFactory, error) {
 // arguments are prefixed automatically, including commands executed in a
 // pipeline. The client is closed when the test finishes.
 //
-// When a test succeeds, its namespaced keys are unlinked during cleanup. Keys
-// are left intact when a test fails so that its Redis state can be inspected.
+// Namespaced keys are unlinked during cleanup. When
+// [WithKeepKeysOnFailure] is enabled, keys are instead left intact after a
+// failed test so that its Redis state can be inspected.
 func (f *RedisFactory) Client(tb testing.TB) redis.UniversalClient {
 	tb.Helper()
 
@@ -125,7 +139,7 @@ func (f *RedisFactory) Client(tb testing.TB) redis.UniversalClient {
 			}
 		}()
 
-		if tb.Failed() {
+		if f.keepKeysOnFailure && tb.Failed() {
 			tb.Logf("failed test, leaving Redis keys matching %q intact", cleanupPattern)
 
 			return
@@ -143,7 +157,7 @@ func (f *RedisFactory) Client(tb testing.TB) redis.UniversalClient {
 }
 
 func (f *RedisFactory) newClient(testName string) (redis.UniversalClient, string) {
-	ns := f.prefixer.Prefix(testName)
+	ns := f.prefixer.Prefix(testName) + strconv.FormatUint(f.ctn.Add(1), 10) + ":"
 	cleanupPattern := strings.NewReplacer(
 		`\`, `\\`,
 		`*`, `\*`,
@@ -207,7 +221,5 @@ func (f *RedisFactory) cleanupKeys(ctx context.Context, match string) error {
 type defaultPrefixer string
 
 func (p defaultPrefixer) Prefix(testName string) string {
-	testHash := sha256.Sum256([]byte(testName))
-
-	return fmt.Sprintf("%s:%x:%s:", p, testHash, url.PathEscape(testName))
+	return fmt.Sprintf("%s:%s:", p, url.PathEscape(testName))
 }

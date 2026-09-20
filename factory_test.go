@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -23,15 +24,121 @@ func (deterministicPrefixer) Prefix(testName string) string {
 	return "redistest:" + url.PathEscape(testName) + ":"
 }
 
-type incrementingPrefixer struct {
-	root string
-	next int
+type cleanupTB struct {
+	testing.TB
+
+	name     string
+	cleanups []func()
+	failed   bool
 }
 
-func (p *incrementingPrefixer) Prefix(_ string) string {
-	p.next++
+func (tb *cleanupTB) Cleanup(cleanup func()) {
+	tb.cleanups = append(tb.cleanups, cleanup)
+}
 
-	return p.root + strconv.Itoa(p.next) + ":"
+func (tb *cleanupTB) Failed() bool {
+	return tb.failed
+}
+
+func (tb *cleanupTB) Helper() {}
+
+func (tb *cleanupTB) Logf(string, ...any) {}
+
+func (tb *cleanupTB) Name() string {
+	return tb.name
+}
+
+func (tb *cleanupTB) runCleanups() {
+	for _, cleanup := range slices.Backward(tb.cleanups) {
+		cleanup()
+	}
+}
+
+func Test_RedisFactory_Client_Cleanup(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name                   string
+		failed                 bool
+		keepKeysOnFailure      bool
+		configureKeepOnFailure bool
+		expectedExists         int64
+	}{
+		{
+			name:           "should remove keys after a failed test by default",
+			failed:         true,
+			expectedExists: 0,
+		},
+		{
+			name:                   "should keep keys after a failed test when configured",
+			failed:                 true,
+			keepKeysOnFailure:      true,
+			configureKeepOnFailure: true,
+			expectedExists:         1,
+		},
+		{
+			name:                   "should remove keys after a successful test when configured",
+			keepKeysOnFailure:      true,
+			configureKeepOnFailure: true,
+			expectedExists:         0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			// Arrange
+			redisAddress := os.Getenv("TEST_REDIS_ADDRESS")
+			opts := &redis.UniversalOptions{Addrs: []string{redisAddress}}
+			prefixer := deterministicPrefixer{}
+
+			factoryOptions := []redistest.Option{
+				redistest.WithOptions(opts),
+				redistest.WithPrefixer(prefixer),
+			}
+			if tt.configureKeepOnFailure {
+				factoryOptions = append(
+					factoryOptions,
+					redistest.WithKeepKeysOnFailure(tt.keepKeysOnFailure),
+				)
+			}
+
+			factory, err := redistest.NewFactory(factoryOptions...)
+			require.NoError(t, err)
+
+			admin := redis.NewUniversalClient(opts)
+			require.NoError(t, admin.Ping(t.Context()).Err())
+
+			tb := &cleanupTB{name: t.Name(), failed: tt.failed}
+			client := factory.Client(tb)
+			physicalKey := prefixer.Prefix(tb.Name()) + "1:key"
+
+			t.Cleanup(func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+
+				if err := admin.Unlink(ctx, physicalKey).Err(); err != nil {
+					t.Logf("failed to unlink test key: %v", err)
+				}
+
+				if err := admin.Close(); err != nil {
+					t.Logf("failed to close Redis client: %v", err)
+				}
+			})
+
+			require.NoError(t, client.Set(t.Context(), "key", "value", 0).Err())
+
+			// Act
+			tb.runCleanups()
+
+			actualExists, err := admin.Exists(t.Context(), physicalKey).Result()
+			require.NoError(t, err)
+
+			// Assert
+			assert.Equal(t, tt.expectedExists, actualExists)
+		})
+	}
 }
 
 func Test_RedisFactory_Client_Pipeline(t *testing.T) {
@@ -74,7 +181,7 @@ func Test_RedisFactory_Client_Pipeline(t *testing.T) {
 				admin := redis.NewUniversalClient(opts)
 				require.NoError(t, admin.Ping(t.Context()).Err())
 
-				prefix := prefixer.Prefix(t.Name())
+				prefix := prefixer.Prefix(t.Name()) + "1:"
 				physicalKeys := []string{prefix + "one", prefix + "two"}
 
 				t.Cleanup(func() {
@@ -137,13 +244,6 @@ func Test_RedisFactory_Client(t *testing.T) {
 	redisAddress := os.Getenv("TEST_REDIS_ADDRESS")
 	opts := &redis.UniversalOptions{Addrs: []string{redisAddress}}
 	prefixer := deterministicPrefixer{}
-	factory, err := redistest.NewFactory(
-		redistest.WithOptions(opts),
-		redistest.WithPrefixer(prefixer),
-	)
-	require.NoError(t, err)
-	require.NotNil(t, factory)
-
 	admin := redis.NewUniversalClient(opts)
 	require.NoError(t, admin.Ping(t.Context()).Err())
 
@@ -172,10 +272,9 @@ func Test_RedisFactory_Client(t *testing.T) {
 		const clientCount = 10
 
 		prefixRoot := "redistest:" + url.PathEscape(t.Name()) + ":"
-		concurrentPrefixer := &incrementingPrefixer{root: prefixRoot}
 		concurrentFactory, err := redistest.NewFactory(
 			redistest.WithOptions(opts),
-			redistest.WithPrefixer(concurrentPrefixer),
+			redistest.WithPrefixer(deterministicPrefixer{}),
 		)
 		require.NoError(t, err)
 
@@ -366,8 +465,14 @@ func Test_RedisFactory_Client(t *testing.T) {
 		t.Run("should prefix keys for "+tt.name, func(t *testing.T) {
 			t.Parallel()
 
+			factory, err := redistest.NewFactory(
+				redistest.WithOptions(opts),
+				redistest.WithPrefixer(prefixer),
+			)
+			require.NoError(t, err)
+
 			client := factory.Client(t)
-			tt.run(t, client, admin, prefixer.Prefix(t.Name()))
+			tt.run(t, client, admin, prefixer.Prefix(t.Name())+"1:")
 		})
 	}
 }
