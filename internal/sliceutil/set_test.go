@@ -31,13 +31,13 @@ func Test_Set_Has(t *testing.T) {
 
 		// Arrange
 		set := sliceutil.NewSet[string]()
-		expectedHas := false
+		isValueExpected := false
 
 		// Act
-		actualHas := set.Has("value")
+		hasValue := set.Has("value")
 
 		// Assert
-		assert.Equal(t, expectedHas, actualHas)
+		assert.Equal(t, isValueExpected, hasValue)
 	})
 
 	t.Run("should return true when the value has been added", func(t *testing.T) {
@@ -47,13 +47,13 @@ func Test_Set_Has(t *testing.T) {
 		set := sliceutil.NewSet[string]()
 		set.Add("value")
 
-		expectedHas := true
+		isValueExpected := true
 
 		// Act
-		actualHas := set.Has("value")
+		hasValue := set.Has("value")
 
 		// Assert
-		assert.Equal(t, expectedHas, actualHas)
+		assert.Equal(t, isValueExpected, hasValue)
 	})
 }
 

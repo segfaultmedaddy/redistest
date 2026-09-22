@@ -33,13 +33,13 @@ const (
 // can be shared by parallel tests and reuses cached Redis command metadata
 // across its clients.
 type RedisFactory struct {
-	mclient           redis.UniversalClient
-	prefixer          Prefixer
-	opts              *redis.UniversalOptions
-	keyFinders        map[string]*commandinfo.KeyFinder
-	mu                sync.Mutex
-	ctn               atomic.Uint64
-	keepKeysOnFailure bool
+	mclient                 redis.UniversalClient
+	prefixer                Prefixer
+	opts                    *redis.UniversalOptions
+	keyFinders              map[string]*commandinfo.KeyFinder
+	mu                      sync.Mutex
+	ctn                     atomic.Uint64
+	shouldKeepKeysOnFailure bool
 }
 
 // Prefixer creates the key prefix used to isolate a test.
@@ -71,9 +71,9 @@ func WithPrefixer(prefixer Prefixer) Option {
 
 // WithKeepKeysOnFailure controls whether keys are retained when a test fails.
 // By default, keys are removed after both successful and failed tests.
-func WithKeepKeysOnFailure(keep bool) Option {
+func WithKeepKeysOnFailure(isKeepKeysOnFailureEnabled bool) Option {
 	return func(f *RedisFactory) {
-		f.keepKeysOnFailure = keep
+		f.shouldKeepKeysOnFailure = isKeepKeysOnFailureEnabled
 	}
 }
 
@@ -86,13 +86,13 @@ func WithKeepKeysOnFailure(keep bool) Option {
 // used.
 func NewFactory(opts ...Option) (*RedisFactory, error) {
 	f := RedisFactory{
-		mclient:           nil,
-		prefixer:          nil,
-		opts:              nil,
-		keyFinders:        make(map[string]*commandinfo.KeyFinder),
-		mu:                sync.Mutex{},
-		ctn:               atomic.Uint64{},
-		keepKeysOnFailure: false,
+		mclient:                 nil,
+		prefixer:                nil,
+		opts:                    nil,
+		keyFinders:              make(map[string]*commandinfo.KeyFinder),
+		mu:                      sync.Mutex{},
+		ctn:                     atomic.Uint64{},
+		shouldKeepKeysOnFailure: false,
 	}
 	for _, opt := range opts {
 		opt(&f)
@@ -139,7 +139,7 @@ func (f *RedisFactory) Client(tb testing.TB) redis.UniversalClient {
 			}
 		}()
 
-		if f.keepKeysOnFailure && tb.Failed() {
+		if f.shouldKeepKeysOnFailure && tb.Failed() {
 			tb.Logf("failed test, leaving Redis keys matching %q intact", cleanupPattern)
 
 			return
@@ -178,7 +178,7 @@ func (f *RedisFactory) keyFinder(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if keyFinder, ok := f.keyFinders[cmdName]; ok {
+	if keyFinder, hasKeyFinder := f.keyFinders[cmdName]; hasKeyFinder {
 		return keyFinder, nil
 	}
 

@@ -27,9 +27,9 @@ func (deterministicPrefixer) Prefix(testName string) string {
 type cleanupTB struct {
 	testing.TB
 
-	name     string
-	cleanups []func()
-	failed   bool
+	name      string
+	cleanups  []func()
+	hasFailed bool
 }
 
 func (tb *cleanupTB) Cleanup(cleanup func()) {
@@ -37,7 +37,7 @@ func (tb *cleanupTB) Cleanup(cleanup func()) {
 }
 
 func (tb *cleanupTB) Failed() bool {
-	return tb.failed
+	return tb.hasFailed
 }
 
 func (tb *cleanupTB) Helper() {}
@@ -58,29 +58,26 @@ func Test_RedisFactory_Client_Cleanup(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name                   string
-		failed                 bool
-		keepKeysOnFailure      bool
-		configureKeepOnFailure bool
-		expectedExists         int64
+		name                    string
+		hasFailed               bool
+		shouldKeepKeysOnFailure bool
+		expectedExists          int64
 	}{
 		{
 			name:           "should remove keys after a failed test by default",
-			failed:         true,
+			hasFailed:      true,
 			expectedExists: 0,
 		},
 		{
-			name:                   "should keep keys after a failed test when configured",
-			failed:                 true,
-			keepKeysOnFailure:      true,
-			configureKeepOnFailure: true,
-			expectedExists:         1,
+			name:                    "should keep keys after a failed test when configured",
+			hasFailed:               true,
+			shouldKeepKeysOnFailure: true,
+			expectedExists:          1,
 		},
 		{
-			name:                   "should remove keys after a successful test when configured",
-			keepKeysOnFailure:      true,
-			configureKeepOnFailure: true,
-			expectedExists:         0,
+			name:                    "should remove keys after a successful test when configured",
+			shouldKeepKeysOnFailure: true,
+			expectedExists:          0,
 		},
 	}
 
@@ -97,10 +94,10 @@ func Test_RedisFactory_Client_Cleanup(t *testing.T) {
 				redistest.WithOptions(opts),
 				redistest.WithPrefixer(prefixer),
 			}
-			if tt.configureKeepOnFailure {
+			if tt.shouldKeepKeysOnFailure {
 				factoryOptions = append(
 					factoryOptions,
-					redistest.WithKeepKeysOnFailure(tt.keepKeysOnFailure),
+					redistest.WithKeepKeysOnFailure(true),
 				)
 			}
 
@@ -110,7 +107,7 @@ func Test_RedisFactory_Client_Cleanup(t *testing.T) {
 			admin := redis.NewUniversalClient(opts)
 			require.NoError(t, admin.Ping(t.Context()).Err())
 
-			tb := &cleanupTB{name: t.Name(), failed: tt.failed}
+			tb := &cleanupTB{name: t.Name(), hasFailed: tt.hasFailed}
 			client := factory.Client(tb)
 			physicalKey := prefixer.Prefix(tb.Name()) + "1:key"
 
@@ -198,6 +195,22 @@ func Test_RedisFactory_Client_Pipeline(t *testing.T) {
 				})
 
 				client := factory.Client(t)
+				streamKey := "stream"
+				streamGroup := "group"
+				expectedStreamValues := map[string]any{"field": "value"}
+
+				require.NoError(t, client.XGroupCreateMkStream(
+					t.Context(),
+					streamKey,
+					streamGroup,
+					"0",
+				).Err())
+				_, xAddErr := client.XAdd(t.Context(), &redis.XAddArgs{
+					Stream: streamKey,
+					Values: expectedStreamValues,
+				}).Result()
+				require.NoError(t, xAddErr)
+
 				pipe := tt.new(client)
 				expectedSetResult := "OK"
 				expectedAppendResult := int64(9)
@@ -207,6 +220,12 @@ func Test_RedisFactory_Client_Pipeline(t *testing.T) {
 				setCmd := pipe.Set(t.Context(), "one", expectedFirstValue, 0)
 				appendCmd := pipe.Append(t.Context(), "two", expectedSecondValue)
 				mgetCmd := pipe.MGet(t.Context(), "one", "two")
+				xReadGroupCmd := pipe.XReadGroup(t.Context(), &redis.XReadGroupArgs{
+					Group:    streamGroup,
+					Consumer: "consumer",
+					Streams:  []string{streamKey, ">"},
+					Block:    -1,
+				})
 
 				// Act
 				_, execErr := pipe.Exec(t.Context())
@@ -221,6 +240,9 @@ func Test_RedisFactory_Client_Pipeline(t *testing.T) {
 				actualValues, mgetErr := mgetCmd.Result()
 				require.NoError(t, mgetErr)
 
+				actualStreams, xReadGroupErr := xReadGroupCmd.Result()
+				require.NoError(t, xReadGroupErr)
+
 				actualPhysicalValues, physicalMGetErr := admin.MGet(
 					t.Context(),
 					physicalKeys...,
@@ -232,6 +254,9 @@ func Test_RedisFactory_Client_Pipeline(t *testing.T) {
 				assert.Equal(t, expectedAppendResult, actualAppendResult)
 				assert.Equal(t, expectedValues, actualValues)
 				assert.Equal(t, expectedValues, actualPhysicalValues)
+				require.Len(t, actualStreams, 1)
+				require.Len(t, actualStreams[0].Messages, 1)
+				assert.Equal(t, expectedStreamValues, actualStreams[0].Messages[0].Values)
 			},
 		)
 	}
@@ -457,6 +482,52 @@ func Test_RedisFactory_Client(t *testing.T) {
 				// Assert
 				assert.Equal(t, expectedResult, actualResult)
 				assert.Equal(t, expectedExists, actualExists)
+			},
+		},
+		{
+			name: "XREADGROUP",
+			run: func(t *testing.T, client, admin redis.UniversalClient, prefix string) {
+				t.Helper()
+
+				// Arrange
+				key := t.Name()
+				group := key
+				consumer := key
+				expectedValues := map[string]any{"field": "value"}
+
+				require.NoError(t, client.XGroupCreateMkStream(t.Context(), key, group, "0").Err())
+				_, err := client.XAdd(t.Context(), &redis.XAddArgs{
+					Stream: key,
+					Values: expectedValues,
+				}).Result()
+				require.NoError(t, err)
+
+				// Act
+				actualStreams, readErr := client.XReadGroup(t.Context(), &redis.XReadGroupArgs{
+					Group:    group,
+					Consumer: consumer,
+					Streams:  []string{key, ">"},
+					Block:    -1,
+				}).Result()
+				require.NoError(t, readErr)
+
+				actualExists, existsErr := admin.Exists(t.Context(), prefix+key, key).Result()
+				require.NoError(t, existsErr)
+
+				actualConsumers, consumersErr := admin.XInfoConsumers(
+					t.Context(),
+					prefix+key,
+					group,
+				).Result()
+				require.NoError(t, consumersErr)
+
+				// Assert
+				require.Len(t, actualStreams, 1)
+				require.Len(t, actualStreams[0].Messages, 1)
+				assert.Equal(t, expectedValues, actualStreams[0].Messages[0].Values)
+				assert.Equal(t, int64(1), actualExists)
+				require.Len(t, actualConsumers, 1)
+				assert.Equal(t, consumer, actualConsumers[0].Name)
 			},
 		},
 	}

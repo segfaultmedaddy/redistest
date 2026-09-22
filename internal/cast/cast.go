@@ -97,8 +97,8 @@ type Array []any
 
 // Cast converts a []any value to Array.
 func (target *Array) Cast(value any) error {
-	array, ok := value.([]any)
-	if !ok {
+	array, isArray := value.([]any)
+	if !isArray {
 		return fmt.Errorf("expected an array, got %T", value)
 	}
 
@@ -112,8 +112,8 @@ type Map map[string]any
 
 // Cast converts a map[string]any value to Map.
 func (target *Map) Cast(value any) error {
-	m, ok := value.(map[string]any)
-	if !ok {
+	m, isMap := value.(map[string]any)
+	if !isMap {
 		return fmt.Errorf("expected a map, got %T", value)
 	}
 

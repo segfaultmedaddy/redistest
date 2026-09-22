@@ -72,11 +72,12 @@ the keys from failed tests for inspection. The client is still closed.
 
 ### Unsupported commands
 
-redistest supports commands whose key arguments Redis fully describes through
-`COMMAND INFO`. If Redis reports an incomplete or unknown key specification,
-redistest returns an error without executing the command. Examples include
-`XREAD`, `XREADGROUP`, `MIGRATE`, `GEORADIUS`, `GEORADIUSBYMEMBER`, `SORT`, and
-`SORT_RO`. The exact set depends on the Redis version.
+redistest supports commands whose key arguments Redis describes through
+`COMMAND INFO`. For incomplete specifications, including `XREAD` and
+`XREADGROUP`, it asks Redis to resolve the keys from the full command. If the
+key positions still cannot be determined unambiguously, or Redis reports an
+unknown specification, redistest returns an error without executing the
+command. The exact set depends on the Redis version.
 
 Commands without key arguments are sent unchanged and are therefore not
 isolated. This includes database-wide commands such as `FLUSHDB`, `FLUSHALL`,

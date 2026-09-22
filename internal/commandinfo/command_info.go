@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/redis/go-redis/v9"
@@ -45,15 +46,15 @@ func (c *CommandInfo) KeyFinder(ctx context.Context, cmd string) (*KeyFinder, er
 		return nil, fmt.Errorf("failed to parse RESP3 command info for %s: %w", cmd, err)
 	}
 
-	specs, err := c.parseSpec(m)
+	finder, err := c.parseSpec(m)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse command info for %s: %w", cmd, err)
 	}
 
-	return &KeyFinder{specs: specs}, nil
+	return finder, nil
 }
 
-func (c *CommandInfo) parseSpec(reply any) ([]spec, error) {
+func (c *CommandInfo) parseSpec(reply any) (*KeyFinder, error) {
 	var commands cast.Array
 	if err := commands.Cast(reply); err != nil {
 		return nil, fmt.Errorf("failed to cast COMMAND INFO reply to array for reply %T: %w", reply, err)
@@ -67,36 +68,94 @@ func (c *CommandInfo) parseSpec(reply any) ([]spec, error) {
 		return nil, errors.New("expected command information, got nil")
 	}
 
+	_, finder, err := c.parseCommand(commands[0])
+
+	return finder, err
+}
+
+func (c *CommandInfo) parseCommand(value any) (string, *KeyFinder, error) {
 	var command cast.Array
-	if err := command.Cast(commands[0]); err != nil {
-		return nil, fmt.Errorf("failed to cast command information to array for value %T: %w", commands[0], err)
+	if err := command.Cast(value); err != nil {
+		return "", nil, fmt.Errorf(
+			"failed to cast command information to array for value %T: %w",
+			value,
+			err,
+		)
 	}
 
 	if len(command) < 9 {
-		return nil, fmt.Errorf(
+		return "", nil, fmt.Errorf(
 			"expected at least 9 command information fields, got %d",
 			len(command),
 		)
 	}
 
+	var name cast.String
+	if err := name.Cast(command[0]); err != nil {
+		return "", nil, fmt.Errorf("failed to cast command name for value %T: %w", command[0], err)
+	}
+
 	var keySpecs cast.Array
 	if err := keySpecs.Cast(command[8]); err != nil {
-		return nil, fmt.Errorf("failed to cast key specifications to array for value %T: %w", command[8], err)
+		return "", nil, fmt.Errorf(
+			"failed to cast key specifications to array for value %T: %w",
+			command[8],
+			err,
+		)
 	}
 
 	specs := make([]spec, 0, len(keySpecs))
+	isDynamic := false
+
 	for i, value := range keySpecs {
-		keySpec, err := parseKeySpec(value)
+		keySpec, isIncomplete, err := parseKeySpec(value)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse key specification for index %d: %w", i, err)
+			return "", nil, fmt.Errorf("failed to parse key specification for index %d: %w", i, err)
 		}
+
+		isDynamic = isDynamic || isIncomplete
 
 		if keySpec != nil {
 			specs = append(specs, *keySpec)
 		}
 	}
 
-	return specs, nil
+	finder := &KeyFinder{
+		client:      c.client,
+		specs:       specs,
+		isDynamic:   isDynamic,
+		subcommands: nil,
+	}
+	if len(command) < 10 {
+		return string(name), finder, nil
+	}
+
+	var subcommandValues cast.Array
+	if err := subcommandValues.Cast(command[9]); err != nil {
+		return "", nil, fmt.Errorf(
+			"failed to cast subcommands to array for value %T: %w",
+			command[9],
+			err,
+		)
+	}
+
+	finder.subcommands = make(map[string]*KeyFinder, len(subcommandValues))
+
+	for i, subcommandValue := range subcommandValues {
+		subcommandName, subcommandFinder, err := c.parseCommand(subcommandValue)
+		if err != nil {
+			return "", nil, fmt.Errorf("failed to parse subcommand for index %d: %w", i, err)
+		}
+
+		separator := strings.LastIndexByte(subcommandName, '|')
+		if separator < 0 || separator == len(subcommandName)-1 {
+			return "", nil, fmt.Errorf("expected qualified subcommand name, got %q", subcommandName)
+		}
+
+		finder.subcommands[strings.ToLower(subcommandName[separator+1:])] = subcommandFinder
+	}
+
+	return string(name), finder, nil
 }
 
 type spec struct {
@@ -105,12 +164,12 @@ type spec struct {
 }
 
 func (s *spec) indexes(args []any) ([]int, error) {
-	start, found, err := s.beginSearch.start(args)
+	start, isFound, err := s.beginSearch.start(args)
 	if err != nil {
 		return nil, err
 	}
 
-	if !found {
+	if !isFound {
 		return nil, nil
 	}
 
@@ -186,7 +245,7 @@ func (s *beginSearchSpec) start(args []any) (int, bool, error) {
 			}
 
 			for i := s.startFrom; i < len(args)-1; i++ {
-				if stringEqualFold(args[i], s.keyword) {
+				if isStringEqualFold(args[i], s.keyword) {
 					return i + 1, true, nil
 				}
 			}
@@ -196,7 +255,7 @@ func (s *beginSearchSpec) start(args []any) (int, bool, error) {
 
 		start := len(args) + s.startFrom
 		for i := start; i > 1 && i < len(args); i-- {
-			if stringEqualFold(args[i], s.keyword) {
+			if isStringEqualFold(args[i], s.keyword) {
 				return i + 1, true, nil
 			}
 		}
@@ -365,11 +424,29 @@ func (s *findKeysSpec) indexes(args []any, offset int) ([]int, error) {
 
 // KeyFinder identifies key arguments in calls to a Redis command.
 type KeyFinder struct {
-	specs []spec
+	client      redis.UniversalClient
+	subcommands map[string]*KeyFinder
+	specs       []spec
+	isDynamic   bool
 }
 
 // Indexes returns the indexes of all Redis key arguments in args.
-func (f *KeyFinder) Indexes(_ context.Context, args []any) ([]int, error) {
+func (f *KeyFinder) Indexes(ctx context.Context, args []any) ([]int, error) {
+	if len(f.subcommands) > 0 && len(args) > 1 {
+		var name cast.String
+		if err := name.Cast(args[1]); err != nil {
+			return nil, fmt.Errorf("failed to cast subcommand name for argument index 1: %w", err)
+		}
+
+		if finder, hasSubcommand := f.subcommands[strings.ToLower(string(name))]; hasSubcommand {
+			return finder.Indexes(ctx, args)
+		}
+	}
+
+	if f.isDynamic {
+		return f.dynamicIndexes(ctx, args)
+	}
+
 	seen := sliceutil.NewSet[int]()
 
 	for i, spec := range f.specs {
@@ -386,21 +463,130 @@ func (f *KeyFinder) Indexes(_ context.Context, args []any) ([]int, error) {
 	return seen.Values(), nil
 }
 
-func parseKeySpec(value any) (*spec, error) {
+func (f *KeyFinder) dynamicIndexes(ctx context.Context, args []any) ([]int, error) {
+	keys, err := f.client.CommandGetKeys(ctx, args...).Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute COMMAND GETKEYS: %w", err)
+	}
+
+	candidates := make([][]int, len(keys))
+	// GETKEYS returns values rather than positions, so probe matching arguments
+	// to distinguish keys from non-key arguments that contain the same value.
+	for index := 1; index < len(args); index++ {
+		var value cast.String
+		if err := value.Cast(args[index]); err != nil {
+			value = cast.String(fmt.Sprint(args[index]))
+		}
+
+		if !slices.Contains(keys, string(value)) {
+			continue
+		}
+
+		marker := fmt.Sprintf("\x00redistest-key-probe-%d", index)
+		for {
+			hasCollision := slices.Contains(keys, marker)
+
+			for _, arg := range args {
+				var argument cast.String
+				if err := argument.Cast(arg); err != nil {
+					argument = cast.String(fmt.Sprint(arg))
+				}
+
+				if string(argument) == marker {
+					hasCollision = true
+
+					break
+				}
+			}
+
+			if !hasCollision {
+				break
+			}
+
+			marker += "\x00"
+		}
+
+		probeArgs := append([]any(nil), args...)
+		probeArgs[index] = marker
+
+		probeKeys, probeErr := f.client.CommandGetKeys(ctx, probeArgs...).Result()
+		if probeErr != nil {
+			if _, isRedisError := errors.AsType[redis.Error](probeErr); !isRedisError {
+				return nil, fmt.Errorf(
+					"failed to probe key argument at index %d with COMMAND GETKEYS: %w",
+					index,
+					probeErr,
+				)
+			}
+
+			continue
+		}
+
+		if len(keys) != len(probeKeys) {
+			continue
+		}
+
+		isValid := true
+
+		for keyIndex := range keys {
+			if keys[keyIndex] != probeKeys[keyIndex] &&
+				(keys[keyIndex] != string(value) || probeKeys[keyIndex] != marker) {
+				isValid = false
+
+				break
+			}
+		}
+
+		if !isValid {
+			continue
+		}
+
+		for keyIndex := range keys {
+			if keys[keyIndex] != probeKeys[keyIndex] {
+				candidates[keyIndex] = append(candidates[keyIndex], index)
+			}
+		}
+	}
+
+	seen := sliceutil.NewSet[int]()
+
+	for keyIndex, indexes := range candidates {
+		if len(indexes) != 1 {
+			return nil, fmt.Errorf(
+				"failed to resolve key argument %d of %d unambiguously: %w",
+				keyIndex+1,
+				len(keys),
+				errors.ErrUnsupported,
+			)
+		}
+
+		seen.Add(indexes[0])
+	}
+
+	return seen.Values(), nil
+}
+
+func parseKeySpec(value any) (*spec, bool, error) {
 	var m cast.Map
 	if err := m.Cast(value); err != nil {
-		return nil, fmt.Errorf("failed to cast key specification to map for value %T: %w", value, err)
+		return nil, false, fmt.Errorf(
+			"failed to cast key specification to map for value %T: %w",
+			value,
+			err,
+		)
 	}
 
 	flags, err := parseField[cast.Array](m, "flags")
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
+
+	isIncomplete := false
 
 	for _, value := range flags {
 		var flag cast.String
 		if err := flag.Cast(value); err != nil {
-			return nil, fmt.Errorf(
+			return nil, false, fmt.Errorf(
 				"failed to cast key specification flag to string for value %T: %w",
 				value,
 				err,
@@ -409,26 +595,27 @@ func parseKeySpec(value any) (*spec, error) {
 
 		switch flag {
 		case "not_key":
-			return nil, nil //nolint:nilnil // A nil specification means Redis marks this argument as not a key.
+			return nil, false, nil
 		case "incomplete":
-			return nil, fmt.Errorf(
-				"incomplete key specification is not supported: %w",
-				errors.ErrUnsupported,
-			)
+			isIncomplete = true
 		}
+	}
+
+	if isIncomplete {
+		return nil, true, nil
 	}
 
 	beginSearch, err := parseField[beginSearchSpec](m, "begin_search")
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	findKeys, err := parseField[findKeysSpec](m, "find_keys")
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	return &spec{beginSearch: beginSearch, findKeys: findKeys}, nil
+	return &spec{beginSearch: beginSearch, findKeys: findKeys}, false, nil
 }
 
 func typedSpec(value any) (string, map[string]any, error) {
@@ -455,7 +642,7 @@ func parseField[T any, P interface {
 	cast.Caster
 }](m map[string]any, name string) (T, error) {
 	var result T
-	if v, ok := m[name]; ok {
+	if v, hasField := m[name]; hasField {
 		if err := P(&result).Cast(v); err != nil {
 			return result, fmt.Errorf("failed to cast field for %q: %w", name, err)
 		}
@@ -466,7 +653,7 @@ func parseField[T any, P interface {
 	return result, fmt.Errorf("expected field %q, got none", name)
 }
 
-func stringEqualFold(value any, expected string) bool {
+func isStringEqualFold(value any, expected string) bool {
 	var argument cast.String
 	if argument.Cast(value) != nil {
 		return false
