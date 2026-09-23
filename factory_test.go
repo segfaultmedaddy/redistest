@@ -3,7 +3,6 @@ package redistest_test
 import (
 	"context"
 	"fmt"
-	"net/url"
 	"os"
 	"slices"
 	"strconv"
@@ -17,12 +16,6 @@ import (
 
 	"go.segfaultmedaddy.com/redistest"
 )
-
-type deterministicPrefixer struct{}
-
-func (deterministicPrefixer) Prefix(testName string) string {
-	return "redistest:" + url.PathEscape(testName) + ":"
-}
 
 type cleanupTB struct {
 	testing.TB
@@ -88,11 +81,9 @@ func Test_RedisFactory_Client_Cleanup(t *testing.T) {
 			// Arrange
 			redisAddress := os.Getenv("TEST_REDIS_ADDRESS")
 			opts := &redis.UniversalOptions{Addrs: []string{redisAddress}}
-			prefixer := deterministicPrefixer{}
 
 			factoryOptions := []redistest.Option{
 				redistest.WithOptions(opts),
-				redistest.WithPrefixer(prefixer),
 			}
 			if tt.shouldKeepKeysOnFailure {
 				factoryOptions = append(
@@ -108,8 +99,8 @@ func Test_RedisFactory_Client_Cleanup(t *testing.T) {
 			require.NoError(t, admin.Ping(t.Context()).Err())
 
 			tb := &cleanupTB{name: t.Name(), hasFailed: tt.hasFailed}
-			client := factory.Client(tb)
-			physicalKey := prefixer.Prefix(tb.Name()) + "1:key"
+			client, prefix := factory.Client(tb)
+			physicalKey := prefix + "key"
 
 			t.Cleanup(func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -136,6 +127,44 @@ func Test_RedisFactory_Client_Cleanup(t *testing.T) {
 			assert.Equal(t, tt.expectedExists, actualExists)
 		})
 	}
+}
+
+func Test_RedisFactory_Client_Scan(t *testing.T) {
+	t.Parallel()
+
+	t.Run(`should scope MATCH when the test name contains *?[\`, func(t *testing.T) {
+		t.Parallel()
+
+		// Arrange
+		redisAddress := os.Getenv("TEST_REDIS_ADDRESS")
+		opts := &redis.UniversalOptions{Addrs: []string{redisAddress}}
+		factory, err := redistest.NewFactory(redistest.WithOptions(opts))
+		require.NoError(t, err)
+
+		client, prefix := factory.Client(t)
+		require.NoError(t, client.Ping(t.Context()).Err())
+
+		logicalKeys := []string{"users:one", "users:two", "orders:one"}
+		require.NoError(t, client.MSet(
+			t.Context(),
+			logicalKeys[0], "value-one",
+			logicalKeys[1], "value-two",
+			logicalKeys[2], "value-three",
+		).Err())
+
+		expectedKeys := []string{prefix + logicalKeys[0], prefix + logicalKeys[1]}
+		iterator := client.Scan(t.Context(), 0, prefix+"users:*", 100).Iterator()
+		actualKeys := make([]string, 0, len(expectedKeys))
+
+		// Act
+		for iterator.Next(t.Context()) {
+			actualKeys = append(actualKeys, iterator.Val())
+		}
+
+		// Assert
+		require.NoError(t, iterator.Err())
+		assert.ElementsMatch(t, expectedKeys, actualKeys)
+	})
 }
 
 func Test_RedisFactory_Client_Pipeline(t *testing.T) {
@@ -167,34 +196,21 @@ func Test_RedisFactory_Client_Pipeline(t *testing.T) {
 				// Arrange
 				redisAddress := os.Getenv("TEST_REDIS_ADDRESS")
 				opts := &redis.UniversalOptions{Addrs: []string{redisAddress}}
-				prefixer := deterministicPrefixer{}
-				factory, err := redistest.NewFactory(
-					redistest.WithOptions(opts),
-					redistest.WithPrefixer(prefixer),
-				)
+				factory, err := redistest.NewFactory(redistest.WithOptions(opts))
 				require.NoError(t, err)
 				require.NotNil(t, factory)
 
 				admin := redis.NewUniversalClient(opts)
 				require.NoError(t, admin.Ping(t.Context()).Err())
 
-				prefix := prefixer.Prefix(t.Name()) + "1:"
-				physicalKeys := []string{prefix + "one", prefix + "two"}
-
 				t.Cleanup(func() {
-					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-					defer cancel()
-
-					if err := admin.Unlink(ctx, physicalKeys...).Err(); err != nil {
-						t.Logf("failed to unlink test keys: %v", err)
-					}
-
 					if err := admin.Close(); err != nil {
 						t.Logf("failed to close Redis client: %v", err)
 					}
 				})
 
-				client := factory.Client(t)
+				client, prefix := factory.Client(t)
+				physicalKeys := []string{prefix + "one", prefix + "two"}
 				streamKey := "stream"
 				streamGroup := "group"
 				expectedStreamValues := map[string]any{"field": "value"}
@@ -268,23 +284,10 @@ func Test_RedisFactory_Client(t *testing.T) {
 	// Arrange
 	redisAddress := os.Getenv("TEST_REDIS_ADDRESS")
 	opts := &redis.UniversalOptions{Addrs: []string{redisAddress}}
-	prefixer := deterministicPrefixer{}
 	admin := redis.NewUniversalClient(opts)
 	require.NoError(t, admin.Ping(t.Context()).Err())
 
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-
-		keys, err := admin.Keys(ctx, "redistest:"+url.PathEscape(t.Name())+"*").Result()
-		if err != nil {
-			t.Logf("failed to find test keys: %v", err)
-		} else if len(keys) > 0 {
-			if err := admin.Unlink(ctx, keys...).Err(); err != nil {
-				t.Logf("failed to unlink test keys: %v", err)
-			}
-		}
-
 		if err := admin.Close(); err != nil {
 			t.Logf("failed to close Redis client: %v", err)
 		}
@@ -296,11 +299,7 @@ func Test_RedisFactory_Client(t *testing.T) {
 		// Arrange
 		const clientCount = 10
 
-		prefixRoot := "redistest:" + url.PathEscape(t.Name()) + ":"
-		concurrentFactory, err := redistest.NewFactory(
-			redistest.WithOptions(opts),
-			redistest.WithPrefixer(deterministicPrefixer{}),
-		)
+		concurrentFactory, err := redistest.NewFactory(redistest.WithOptions(opts))
 		require.NoError(t, err)
 
 		clients := make([]redis.UniversalClient, clientCount)
@@ -308,9 +307,10 @@ func Test_RedisFactory_Client(t *testing.T) {
 		physicalKeys := make([]string, clientCount)
 
 		for i := range clientCount {
-			clients[i] = concurrentFactory.Client(t)
+			client, prefix := concurrentFactory.Client(t)
+			clients[i] = client
 			expectedValues[i] = strconv.Itoa(i)
-			physicalKeys[i] = prefixRoot + strconv.Itoa(i+1) + ":shared-key"
+			physicalKeys[i] = prefix + "shared-key"
 		}
 
 		results := make([]struct {
@@ -536,14 +536,11 @@ func Test_RedisFactory_Client(t *testing.T) {
 		t.Run("should prefix keys for "+tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			factory, err := redistest.NewFactory(
-				redistest.WithOptions(opts),
-				redistest.WithPrefixer(prefixer),
-			)
+			factory, err := redistest.NewFactory(redistest.WithOptions(opts))
 			require.NoError(t, err)
 
-			client := factory.Client(t)
-			tt.run(t, client, admin, prefixer.Prefix(t.Name())+"1:")
+			client, prefix := factory.Client(t)
+			tt.run(t, client, admin, prefix)
 		})
 	}
 }
