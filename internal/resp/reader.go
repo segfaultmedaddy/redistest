@@ -123,8 +123,8 @@ func (r *Reader) readMap(line []byte) (map[string]any, error) {
 			return nil, fmt.Errorf("failed to read RESP3 map key for index %d: %w", i, err)
 		}
 
-		keyString, isString := key.(string)
-		if !isString {
+		keyString, ok := key.(string)
+		if !ok {
 			return nil, fmt.Errorf("expected string map key, got %T", key)
 		}
 

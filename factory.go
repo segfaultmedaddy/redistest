@@ -163,7 +163,7 @@ func (f *RedisFactory) keyFinder(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if keyFinder, hasKeyFinder := f.keyFinders[cmdName]; hasKeyFinder {
+	if keyFinder, ok := f.keyFinders[cmdName]; ok {
 		return keyFinder, nil
 	}
 

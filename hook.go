@@ -80,7 +80,7 @@ func (t *prefixHook) namespace(ctx context.Context, cmder redis.Cmder) error {
 	args := cmder.Args()
 	for _, index := range indexes {
 		arg := args[index]
-		if value, isByteSlice := arg.([]byte); isByteSlice {
+		if value, ok := arg.([]byte); ok {
 			if bytes.HasPrefix(value, []byte(t.ns)) {
 				continue
 			}

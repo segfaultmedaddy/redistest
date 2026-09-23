@@ -9,7 +9,7 @@ func NewSet[K comparable]() *Set[K] {
 }
 
 func (s *Set[K]) Has(k K) bool {
-	if _, hasValue := s.m[k]; hasValue {
+	if _, ok := s.m[k]; ok {
 		return true
 	}
 

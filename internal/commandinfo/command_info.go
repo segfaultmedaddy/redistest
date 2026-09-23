@@ -46,7 +46,7 @@ func (c *CommandInfo) KeyFinder(ctx context.Context, cmd string) (*KeyFinder, er
 		return nil, fmt.Errorf("failed to parse RESP3 command info for %s: %w", cmd, err)
 	}
 
-	finder, err := c.parseSpec(m)
+	finder, err := c.keyFinder(m)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse command info for %s: %w", cmd, err)
 	}
@@ -54,10 +54,14 @@ func (c *CommandInfo) KeyFinder(ctx context.Context, cmd string) (*KeyFinder, er
 	return finder, nil
 }
 
-func (c *CommandInfo) parseSpec(reply any) (*KeyFinder, error) {
+func (c *CommandInfo) keyFinder(reply any) (*KeyFinder, error) {
 	var commands cast.Array
 	if err := commands.Cast(reply); err != nil {
-		return nil, fmt.Errorf("failed to cast COMMAND INFO reply to array for reply %T: %w", reply, err)
+		return nil, fmt.Errorf(
+			"failed to cast COMMAND INFO reply to array for reply %T: %w",
+			reply,
+			err,
+		)
 	}
 
 	if len(commands) != 1 {
@@ -130,6 +134,8 @@ func (c *CommandInfo) parseCommand(value any) (string, *KeyFinder, error) {
 		return string(name), finder, nil
 	}
 
+	// Redis reports key specifications for commands such as XGROUP CREATE only
+	// on nested subcommand metadata, so retain a finder for each subcommand.
 	var subcommandValues cast.Array
 	if err := subcommandValues.Cast(command[9]); err != nil {
 		return "", nil, fmt.Errorf(
@@ -262,7 +268,11 @@ func (s *beginSearchSpec) start(args []any) (int, bool, error) {
 
 		return 0, false, nil
 	default:
-		return 0, false, fmt.Errorf("begin search type %q is not supported: %w", s.typ, errors.ErrUnsupported)
+		return 0, false, fmt.Errorf(
+			"begin search type %q is not supported: %w",
+			s.typ,
+			errors.ErrUnsupported,
+		)
 	}
 }
 
@@ -398,7 +408,11 @@ func (s *findKeysSpec) indexes(args []any, offset int) ([]int, error) {
 
 		first := offset + s.firstKey
 		if first < 0 || first >= len(args) {
-			return nil, fmt.Errorf("expected first key index in range [0, %d], got %d", len(args)-1, first)
+			return nil, fmt.Errorf(
+				"expected first key index in range [0, %d], got %d",
+				len(args)-1,
+				first,
+			)
 		}
 
 		if numKeys-1 > (len(args)-1-first)/s.keyStep {
@@ -418,7 +432,11 @@ func (s *findKeysSpec) indexes(args []any, offset int) ([]int, error) {
 		return steps(first, last, s.keyStep), nil
 
 	default:
-		return nil, fmt.Errorf("find keys type %q is not supported: %w", s.typ, errors.ErrUnsupported)
+		return nil, fmt.Errorf(
+			"find keys type %q is not supported: %w",
+			s.typ,
+			errors.ErrUnsupported,
+		)
 	}
 }
 
@@ -438,7 +456,7 @@ func (f *KeyFinder) Indexes(ctx context.Context, args []any) ([]int, error) {
 			return nil, fmt.Errorf("failed to cast subcommand name for argument index 1: %w", err)
 		}
 
-		if finder, hasSubcommand := f.subcommands[strings.ToLower(string(name))]; hasSubcommand {
+		if finder, ok := f.subcommands[strings.ToLower(string(name))]; ok {
 			return finder.Indexes(ctx, args)
 		}
 	}
@@ -452,7 +470,11 @@ func (f *KeyFinder) Indexes(ctx context.Context, args []any) ([]int, error) {
 	for i, spec := range f.specs {
 		found, err := spec.indexes(args)
 		if err != nil {
-			return nil, fmt.Errorf("failed to find key indexes for key specification %d: %w", i, err)
+			return nil, fmt.Errorf(
+				"failed to find key indexes for key specification %d: %w",
+				i,
+				err,
+			)
 		}
 
 		for _, index := range found {
@@ -511,7 +533,7 @@ func (f *KeyFinder) dynamicIndexes(ctx context.Context, args []any) ([]int, erro
 
 		probeKeys, probeErr := f.client.CommandGetKeys(ctx, probeArgs...).Result()
 		if probeErr != nil {
-			if _, isRedisError := errors.AsType[redis.Error](probeErr); !isRedisError {
+			if _, ok := errors.AsType[redis.Error](probeErr); !ok {
 				return nil, fmt.Errorf(
 					"failed to probe key argument at index %d with COMMAND GETKEYS: %w",
 					index,
@@ -621,7 +643,11 @@ func parseKeySpec(value any) (*spec, bool, error) {
 func typedSpec(value any) (string, map[string]any, error) {
 	var m cast.Map
 	if err := m.Cast(value); err != nil {
-		return "", nil, fmt.Errorf("failed to cast typed specification to map for value %T: %w", value, err)
+		return "", nil, fmt.Errorf(
+			"failed to cast typed specification to map for value %T: %w",
+			value,
+			err,
+		)
 	}
 
 	typ, err := parseField[cast.String](m, "type")
@@ -642,7 +668,7 @@ func parseField[T any, P interface {
 	cast.Caster
 }](m map[string]any, name string) (T, error) {
 	var result T
-	if v, hasField := m[name]; hasField {
+	if v, ok := m[name]; ok {
 		if err := P(&result).Cast(v); err != nil {
 			return result, fmt.Errorf("failed to cast field for %q: %w", name, err)
 		}
