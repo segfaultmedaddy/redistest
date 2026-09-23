@@ -56,9 +56,9 @@ func WithOptions(opts *redis.UniversalOptions) Option {
 
 // WithKeepKeysOnFailure controls whether keys are retained when a test fails.
 // By default, keys are removed after both successful and failed tests.
-func WithKeepKeysOnFailure(isKeepKeysOnFailureEnabled bool) Option {
+func WithKeepKeysOnFailure(shouldKeepKeysOnFailure bool) Option {
 	return func(f *RedisFactory) {
-		f.shouldKeepKeysOnFailure = isKeepKeysOnFailureEnabled
+		f.shouldKeepKeysOnFailure = shouldKeepKeysOnFailure
 	}
 }
 
@@ -148,7 +148,10 @@ func (f *RedisFactory) newClient(testName string) (redis.UniversalClient, string
 		`?`, `%3F`,
 		`[`, `%5B`,
 	).Replace(url.PathEscape(testName))
-	prefix := f.factoryPrefix + ":" + escapedTestName + ":" + strconv.FormatUint(f.ctn.Add(1), 10) + ":"
+	prefix := f.factoryPrefix + ":" + escapedTestName + ":" + strconv.FormatUint(
+		f.ctn.Add(1),
+		10,
+	) + ":"
 
 	client := redis.NewUniversalClient(f.opts)
 	client.AddHook(newPrefixHook(prefix, f))

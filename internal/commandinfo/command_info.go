@@ -87,6 +87,18 @@ func (c *CommandInfo) parseCommand(value any) (string, *KeyFinder, error) {
 		)
 	}
 
+	// COMMAND INFO fields use these positions. See
+	// https://redis.io/docs/latest/commands/command-info/ for the response layout.
+	//  1. name (index 0)
+	//  2. arity (index 1)
+	//  3. flags (index 2)
+	//  4. first key position (index 3)
+	//  5. last key position (index 4)
+	//  6. key step (index 5)
+	//  7. ACL categories (index 6)
+	//  8. tips (index 7)
+	//  9. key specifications (index 8)
+	// 10. subcommands (index 9, optional)
 	if len(command) < 9 {
 		return "", nil, fmt.Errorf(
 			"expected at least 9 command information fields, got %d",
@@ -130,6 +142,8 @@ func (c *CommandInfo) parseCommand(value any) (string, *KeyFinder, error) {
 		isDynamic:   isDynamic,
 		subcommands: nil,
 	}
+	// A nine-field reply still contains all key specifications needed for the
+	// parent command.
 	if len(command) < 10 {
 		return string(name), finder, nil
 	}
