@@ -29,24 +29,16 @@ const (
 // RedisFactory manages Redis clients used for isolated tests.
 //
 // Each client created by [RedisFactory.Client] transparently prefixes its key
-// arguments with a namespace supplied by the configured [Prefixer]. A factory
-// can be shared by parallel tests and reuses cached Redis command metadata
-// across its clients.
+// arguments with a unique namespace. A factory can be shared by parallel tests
+// and reuses cached Redis command metadata across its clients.
 type RedisFactory struct {
-	mclient           redis.UniversalClient
-	prefixer          Prefixer
-	opts              *redis.UniversalOptions
-	keyFinders        map[string]*commandinfo.KeyFinder
-	mu                sync.Mutex
-	ctn               atomic.Uint64
-	keepKeysOnFailure bool
-}
-
-// Prefixer creates the key prefix used to isolate a test.
-//
-// Prefix must return a non-empty prefix that uniquely identifies testName.
-type Prefixer interface {
-	Prefix(testName string) string
+	mclient                 redis.UniversalClient
+	opts                    *redis.UniversalOptions
+	keyFinders              map[string]*commandinfo.KeyFinder
+	factoryPrefix           string
+	mu                      sync.Mutex
+	ctn                     atomic.Uint64
+	shouldKeepKeysOnFailure bool
 }
 
 // Option configures a [RedisFactory].
@@ -62,37 +54,29 @@ func WithOptions(opts *redis.UniversalOptions) Option {
 	}
 }
 
-// WithPrefixer sets the [Prefixer] used to create test key prefixes.
-func WithPrefixer(prefixer Prefixer) Option {
-	return func(f *RedisFactory) {
-		f.prefixer = prefixer
-	}
-}
-
 // WithKeepKeysOnFailure controls whether keys are retained when a test fails.
 // By default, keys are removed after both successful and failed tests.
-func WithKeepKeysOnFailure(keep bool) Option {
+func WithKeepKeysOnFailure(shouldKeepKeysOnFailure bool) Option {
 	return func(f *RedisFactory) {
-		f.keepKeysOnFailure = keep
+		f.shouldKeepKeysOnFailure = shouldKeepKeysOnFailure
 	}
 }
 
 // NewFactory creates a new [RedisFactory].
 //
-// Unless [WithPrefixer] is provided, NewFactory generates a random
-// process-level key prefix. It returns an error if the prefix cannot be
-// generated. The factory does not connect to Redis until one of its clients
-// executes a command. If WithOptions is not provided, go-redis defaults are
-// used.
+// NewFactory generates a random factory-level key prefix and returns an error
+// if the prefix cannot be generated. The factory does not connect to Redis
+// until one of its clients executes a command. If WithOptions is not provided,
+// go-redis defaults are used.
 func NewFactory(opts ...Option) (*RedisFactory, error) {
 	f := RedisFactory{
-		mclient:           nil,
-		prefixer:          nil,
-		opts:              nil,
-		keyFinders:        make(map[string]*commandinfo.KeyFinder),
-		mu:                sync.Mutex{},
-		ctn:               atomic.Uint64{},
-		keepKeysOnFailure: false,
+		mclient:                 nil,
+		opts:                    nil,
+		keyFinders:              make(map[string]*commandinfo.KeyFinder),
+		factoryPrefix:           "",
+		mu:                      sync.Mutex{},
+		ctn:                     atomic.Uint64{},
+		shouldKeepKeysOnFailure: false,
 	}
 	for _, opt := range opts {
 		opt(&f)
@@ -102,35 +86,36 @@ func NewFactory(opts ...Option) (*RedisFactory, error) {
 		f.opts = &redis.UniversalOptions{}
 	}
 
-	if f.prefixer == nil {
-		prefix := make([]byte, 16)
+	prefix := make([]byte, 16)
 
-		_, err := rand.Read(prefix)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read random bytes for process key prefix: %w", err)
-		}
-
-		f.prefixer = defaultPrefixer(hex.EncodeToString(prefix))
+	_, err := rand.Read(prefix)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read random bytes for factory key prefix: %w", err)
 	}
 
+	f.factoryPrefix = hex.EncodeToString(prefix)
 	f.mclient = redis.NewUniversalClient(f.opts)
 
 	return &f, nil
 }
 
-// Client returns a Redis client with a unique key namespace for tb.
+// Client returns a Redis client and physical prefix with a unique key
+// namespace for tb.
 //
 // The client can be used like any other [redis.UniversalClient]. Redis key
 // arguments are prefixed automatically, including commands executed in a
-// pipeline. The client is closed when the test finishes.
+// pipeline. The prefix contains no Redis glob metacharacters and can be
+// prepended to a logical glob pattern to scope commands such as SCAN that do
+// not declare key arguments. The client is closed when the test finishes.
 //
 // Namespaced keys are unlinked during cleanup. When
 // [WithKeepKeysOnFailure] is enabled, keys are instead left intact after a
 // failed test so that its Redis state can be inspected.
-func (f *RedisFactory) Client(tb testing.TB) redis.UniversalClient {
+func (f *RedisFactory) Client(tb testing.TB) (redis.UniversalClient, string) {
 	tb.Helper()
 
-	client, cleanupPattern := f.newClient(tb.Name())
+	client, prefix := f.newClient(tb.Name())
+	cleanupPattern := prefix + "*"
 
 	tb.Cleanup(func() {
 		defer func() {
@@ -139,7 +124,7 @@ func (f *RedisFactory) Client(tb testing.TB) redis.UniversalClient {
 			}
 		}()
 
-		if f.keepKeysOnFailure && tb.Failed() {
+		if f.shouldKeepKeysOnFailure && tb.Failed() {
 			tb.Logf("failed test, leaving Redis keys matching %q intact", cleanupPattern)
 
 			return
@@ -153,22 +138,25 @@ func (f *RedisFactory) Client(tb testing.TB) redis.UniversalClient {
 		}
 	})
 
-	return client
+	return client, prefix
 }
 
 func (f *RedisFactory) newClient(testName string) (redis.UniversalClient, string) {
-	ns := f.prefixer.Prefix(testName) + strconv.FormatUint(f.ctn.Add(1), 10) + ":"
-	cleanupPattern := strings.NewReplacer(
-		`\`, `\\`,
-		`*`, `\*`,
-		`?`, `\?`,
-		`[`, `\[`,
-	).Replace(ns) + "*"
+	escapedTestName := strings.NewReplacer(
+		`\`, `%5C`,
+		`*`, `%2A`,
+		`?`, `%3F`,
+		`[`, `%5B`,
+	).Replace(url.PathEscape(testName))
+	prefix := f.factoryPrefix + ":" + escapedTestName + ":" + strconv.FormatUint(
+		f.ctn.Add(1),
+		10,
+	) + ":"
 
 	client := redis.NewUniversalClient(f.opts)
-	client.AddHook(newPrefixHook(ns, f))
+	client.AddHook(newPrefixHook(prefix, f))
 
-	return client, cleanupPattern
+	return client, prefix
 }
 
 func (f *RedisFactory) keyFinder(
@@ -216,10 +204,4 @@ func (f *RedisFactory) cleanupKeys(ctx context.Context, match string) error {
 
 		cursor = nextCursor
 	}
-}
-
-type defaultPrefixer string
-
-func (p defaultPrefixer) Prefix(testName string) string {
-	return fmt.Sprintf("%s:%s:", p, url.PathEscape(testName))
 }

@@ -60,6 +60,31 @@ func Test_KeyFinder_Indexes(t *testing.T) {
 			args:            []any{"ZUNIONSTORE", "destination", 2, "one", "two", "WEIGHTS", 1, 2},
 			expectedIndexes: []int{1, 3, 4},
 		},
+		{
+			name:            "should find the stream key for the XGROUP CREATE subcommand",
+			command:         "XGROUP",
+			args:            []any{"XGROUP", "CREATE", "stream", "group", "0", "MKSTREAM"},
+			expectedIndexes: []int{2},
+		},
+		{
+			name: "should find stream keys when XREADGROUP has an " +
+				"incomplete key specification",
+			command: "XREADGROUP",
+			args: []any{
+				"XREADGROUP", "GROUP", "group", "consumer", "COUNT", 1,
+				"STREAMS", "one", "two", ">", ">",
+			},
+			expectedIndexes: []int{7, 8},
+		},
+		{
+			name:    "should distinguish an XREADGROUP key when earlier arguments equal STREAMS",
+			command: "XREADGROUP",
+			args: []any{
+				"XREADGROUP", "COUNT", 1, "GROUP", "STREAMS", "STREAMS",
+				"STREAMS", []byte("STREAMS"), ">",
+			},
+			expectedIndexes: []int{7},
+		},
 	}
 
 	for _, tt := range tests {
